@@ -1,3 +1,4 @@
+import os
 import re
 
 # Define placeholders for dataset paths
@@ -26,12 +27,34 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+# GroundCUA GUI-grounding SFT data prepared by tools/prepare_groundcua_sft.py.
+# Absolute image paths are stored in the JSONL itself, so data_path can remain empty.
+# The environment variable makes the fork portable across machines while preserving a
+# sensible default for this project's layout.
+GROUND_CUA_SFT = {
+    "annotation_path": os.environ.get(
+        "GROUND_CUA_SFT_JSONL",
+        "/home/kwangryeol/workspace/Qwen3-8B-Instruct/datasets/groundcua/sft/qwen3vl_train.jsonl",
+    ),
+    "data_path": "",
+}
+
+GROUND_CUA_SFT_SMOKE = {
+    "annotation_path": os.environ.get(
+        "GROUND_CUA_SFT_SMOKE_JSONL",
+        "/home/kwangryeol/workspace/Qwen3-8B-Instruct/datasets/groundcua/sft/qwen3vl_train_smoke.jsonl",
+    ),
+    "data_path": "",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    "groundcua_sft": GROUND_CUA_SFT,
+    "groundcua_sft_smoke": GROUND_CUA_SFT_SMOKE,
 }
 
 
