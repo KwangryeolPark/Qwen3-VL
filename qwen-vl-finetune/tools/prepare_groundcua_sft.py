@@ -103,7 +103,10 @@ def _select_image_column(available: set[str]) -> str:
 
 def convert(input_path: Path, output_path: Path, limit: int | None, strict: bool) -> dict[str, Any]:
     parquet = pq.ParquetFile(input_path)
-    available = set(parquet.schema.names)
+    # ParquetFile.schema.names exposes physical leaf names. For a list<string>
+    # column such as `images`, the physical leaf may be named `element`.
+    # Use the Arrow schema to recover the actual top-level column names.
+    available = set(parquet.schema_arrow.names)
 
     required = {"problem", "answer"}
     missing = required - available
@@ -114,7 +117,7 @@ def convert(input_path: Path, output_path: Path, limit: int | None, strict: bool
         )
 
     image_column = _select_image_column(available)
-    print(f"Parquet columns: {sorted(available)}")
+    print(f"Arrow columns: {sorted(available)}")
     print(f"Using image column: {image_column}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
