@@ -2,7 +2,7 @@
 """Convert the prepared GroundCUA EasyR1 parquet into Qwen3-VL SFT JSONL.
 
 The converter intentionally reuses the same GUI-grounding prompt and tool-call
-output protocol used by the GroundCUA EasyR1/GRPO pipeline.  This keeps the SFT
+output protocol used by the GroundCUA EasyR1/GRPO pipeline. This keeps the SFT
 checkpoint directly compatible with the later EasyR1 RL stage.
 """
 
@@ -33,13 +33,15 @@ The screen coordinate system is normalized to 1000 x 1000:
 Return exactly one tool call in the following format:
 
 <tool_call>
-{\"name\":\"computer_use\",\"arguments\":{\"action\":\"left_click\",\"coordinate\":[x,y]}}
+{{\"name\":\"computer_use\",\"arguments\":{{\"action\":\"left_click\",\"coordinate\":[x,y]}}}}
 </tool_call>
 
 The coordinate should be near the center of the target UI element.
 
 User instruction:
 {problem}"""
+
+IMAGE_COLUMN_CANDIDATES = ("images", "image", "image_path")
 
 
 def _parse_answer(value: Any) -> tuple[int, int]:
@@ -71,7 +73,7 @@ def _image_path(value: Any) -> str:
     elif isinstance(value, (list, tuple)) and len(value) == 1:
         path = str(value[0])
     else:
-        raise ValueError("images must be a path or a single-item path list")
+        raise ValueError("image field must be a path or a single-item path list")
 
     image = Path(path)
     if not image.is_absolute():
@@ -89,20 +91,38 @@ def _tool_call(x: int, y: int) -> str:
     return f"<tool_call>{json.dumps(payload, separators=(',', ':'))}</tool_call>"
 
 
+def _select_image_column(available: set[str]) -> str:
+    for candidate in IMAGE_COLUMN_CANDIDATES:
+        if candidate in available:
+            return candidate
+    raise ValueError(
+        "no supported image column found; expected one of "
+        f"{IMAGE_COLUMN_CANDIDATES}, available columns are {sorted(available)}"
+    )
+
+
 def convert(input_path: Path, output_path: Path, limit: int | None, strict: bool) -> dict[str, Any]:
     parquet = pq.ParquetFile(input_path)
     available = set(parquet.schema.names)
-    required = {"problem", "images", "answer"}
+
+    required = {"problem", "answer"}
     missing = required - available
     if missing:
-        raise ValueError(f"missing required parquet columns: {sorted(missing)}")
+        raise ValueError(
+            f"missing required parquet columns: {sorted(missing)}; "
+            f"available columns: {sorted(available)}"
+        )
+
+    image_column = _select_image_column(available)
+    print(f"Parquet columns: {sorted(available)}")
+    print(f"Using image column: {image_column}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
     skipped = 0
     errors: dict[str, int] = {}
 
-    columns = ["problem", "images", "answer"]
+    columns = ["problem", image_column, "answer"]
     if "id" in available:
         columns.append("id")
 
@@ -119,7 +139,7 @@ def convert(input_path: Path, output_path: Path, limit: int | None, strict: bool
                     problem = str(data["problem"][i]).strip()
                     if not problem:
                         raise ValueError("empty problem")
-                    image = _image_path(data["images"][i])
+                    image = _image_path(data[image_column][i])
                     x, y = _parse_answer(data["answer"][i])
                     record = {
                         "image": image,
@@ -148,6 +168,7 @@ def convert(input_path: Path, output_path: Path, limit: int | None, strict: bool
         "rows_written": written,
         "rows_skipped": skipped,
         "limit": limit,
+        "source_image_column": image_column,
         "coordinate_system": "normalized 0..1000; target is rounded bbox center",
         "output_protocol": "computer_use left_click tool_call",
         "errors": errors,
