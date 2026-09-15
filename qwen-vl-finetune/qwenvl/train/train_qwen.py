@@ -16,6 +16,7 @@
 
 import json
 import logging
+import math
 import os
 import pathlib
 import shutil
@@ -81,18 +82,15 @@ def _hardlink_or_copy(src: Path, dst: Path):
 
 
 class EvalSnapshotCallback(TrainerCallback):
-    """Preserve evaluation-ready model snapshots without DeepSpeed optimizer state.
+    """Trigger milestone saves and preserve model-only evaluation snapshots.
 
-    Trainer writes a full resumable checkpoint at each save event.  With
-    save_total_limit=1 only the latest such checkpoint is retained.  This callback
-    hard-links the model/tokenizer/config files from each checkpoint into a
-    separate snapshot directory and writes the processor files there.  The large
-    DeepSpeed optimizer state is therefore kept only for the most recent resume
-    checkpoint, while milestone model weights remain available for evaluation.
+    Saves are triggered at 25/50/75/100% of the actual Trainer max_steps.  Trainer
+    writes a full resumable DeepSpeed checkpoint, while this callback hard-links
+    only the reloadable HF model/tokenizer/config files into a persistent snapshot
+    directory.  With save_total_limit=1, only the latest large resume checkpoint is
+    retained, while all four lightweight evaluation snapshots remain available.
     """
 
-    # Root-level Trainer files needed to reload the HF model/tokenizer.  Processor
-    # files are written separately via processor.save_pretrained().
     _EXCLUDED_FILES = {
         "optimizer.pt",
         "scheduler.pt",
@@ -101,12 +99,33 @@ class EvalSnapshotCallback(TrainerCallback):
         "training_args.bin",
     }
 
-    def __init__(self, processor, snapshot_root: str):
+    def __init__(self, processor, snapshot_root: str, fractions=(0.25, 0.50, 0.75, 1.0)):
         self.processor = processor
         self.snapshot_root = Path(snapshot_root)
+        self.fractions = tuple(fractions)
+        self._targets = None
+
+    def _target_steps(self, state):
+        if self._targets is None:
+            self._targets = {
+                min(state.max_steps, max(1, math.ceil(state.max_steps * f)))
+                for f in self.fractions
+            }
+        return self._targets
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        targets = sorted(self._target_steps(state))
+        if args.should_save:
+            print(f"Evaluation milestone steps: {targets}")
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step in self._target_steps(state):
+            control.should_save = True
+        return control
 
     def on_save(self, args, state, control, **kwargs):
-        if not args.should_save:
+        if not args.should_save or state.global_step not in self._target_steps(state):
             return control
 
         checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
@@ -122,18 +141,17 @@ class EvalSnapshotCallback(TrainerCallback):
         for src in checkpoint_dir.iterdir():
             if not src.is_file() or src.name in self._EXCLUDED_FILES:
                 continue
-            # Do not retain RNG or other training-only state files.
             if src.name.startswith("rng_state"):
                 continue
             _hardlink_or_copy(src, snapshot_dir / src.name)
             copied.append(src.name)
 
-        # Qwen VL evaluation requires image/video processor metadata in addition
-        # to the tokenizer files saved by Trainer.
         self.processor.save_pretrained(snapshot_dir)
 
         metadata = {
             "global_step": int(state.global_step),
+            "max_steps": int(state.max_steps),
+            "progress_fraction": float(state.global_step / state.max_steps),
             "epoch": epoch,
             "source_checkpoint": str(checkpoint_dir),
             "copied_files": sorted(copied),
@@ -216,9 +234,7 @@ def train(attn_implementation="flash_attention_2"):
         data_args.model_type = "qwen2vl"
 
     print(f'the initlized model is {model_args.model_name_or_path} the class is {model.__class__.__name__}')
-    processor = AutoProcessor.from_pretrained(
-        model_args.model_name_or_path,
-    )
+    processor = AutoProcessor.from_pretrained(model_args.model_name_or_path)
 
     if data_args.data_flatten or data_args.data_packing:
         replace_qwen2_vl_attention_class()
@@ -228,10 +244,8 @@ def train(attn_implementation="flash_attention_2"):
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
-
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
-
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -245,10 +259,8 @@ def train(attn_implementation="flash_attention_2"):
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model, TaskType
         print("LoRA enabled")
-
         for p in model.parameters():
             p.requires_grad = False
-
         lora_config = LoraConfig(
             r=training_args.lora_r or 64,
             lora_alpha=training_args.lora_alpha or 128,
@@ -260,7 +272,6 @@ def train(attn_implementation="flash_attention_2"):
         model = get_peft_model(model, lora_config)
     else:
         set_model(model_args, model)
-
         if torch.distributed.get_rank() == 0:
             model.visual.print_trainable_parameters()
             model.model.print_trainable_parameters()
@@ -271,9 +282,7 @@ def train(attn_implementation="flash_attention_2"):
     )
 
     if training_args.save_eval_snapshots:
-        snapshot_root = training_args.eval_snapshot_dir
-        if not snapshot_root:
-            snapshot_root = str(Path(training_args.output_dir) / "eval_snapshots")
+        snapshot_root = training_args.eval_snapshot_dir or str(Path(training_args.output_dir) / "eval_snapshots")
         trainer.add_callback(EvalSnapshotCallback(processor, snapshot_root))
         rank0_print(f"Evaluation snapshots enabled: {snapshot_root}")
 
