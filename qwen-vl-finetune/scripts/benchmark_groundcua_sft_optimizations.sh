@@ -18,6 +18,55 @@ mkdir -p "${BENCH_DIR}"
 cd "${SFT_ROOT}"
 chmod +x "${SMOKE_SCRIPT}" 2>/dev/null || true
 
+notify_email() {
+  local rc=${1:-0}
+
+  # Optional notification: silently skip on systems without NOTIFY_EMAIL/mail.
+  if [[ -z "${NOTIFY_EMAIL:-}" ]]; then
+    return 0
+  fi
+  if ! command -v mail >/dev/null 2>&1; then
+    echo "NOTIFY_EMAIL is set, but 'mail' is not available; skipping notification." >&2
+    return 0
+  fi
+
+  local host status subject
+  host=$(hostname)
+  if [[ ${rc} -eq 0 ]]; then
+    status="COMPLETED"
+  else
+    status="FAILED (exit=${rc})"
+  fi
+  subject="[GroundCUA SFT] Optimization sweep ${status} - ${host}"
+
+  {
+    echo "GroundCUA SFT optimization sweep finished."
+    echo
+    echo "Host: ${host}"
+    echo "Status: ${status}"
+    echo "Finished: $(date --iso-8601=seconds)"
+    echo "Benchmark directory: ${BENCH_DIR}"
+    echo "Summary CSV: ${SUMMARY_CSV}"
+    echo
+    if [[ -f "${SUMMARY_CSV}" ]]; then
+      echo "==================== SUMMARY ===================="
+      if command -v column >/dev/null 2>&1; then
+        column -s, -t < "${SUMMARY_CSV}"
+      else
+        cat "${SUMMARY_CSV}"
+      fi
+    fi
+  } | mail -s "${subject}" "${NOTIFY_EMAIL}" || true
+}
+
+on_exit() {
+  local rc=$?
+  trap - EXIT
+  notify_email "${rc}"
+  exit "${rc}"
+}
+trap on_exit EXIT
+
 # case|zero_cfg|bs|ga|decode|workers|persistent|prefetch|optim|grad_ckpt
 DEFAULT_CASES=$(cat <<'EOF'
 legacy_z3_bs2|./scripts/zero3.json|2|16|True|8|False|2|adamw_torch|True
