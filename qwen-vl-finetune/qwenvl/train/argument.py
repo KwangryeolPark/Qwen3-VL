@@ -43,6 +43,10 @@ class TrainingArguments(transformers.TrainingArguments):
     # Benchmark-only switch: skip expensive final HF/processor save while retaining
     # the full train loop and trainer metrics.
     skip_final_save: bool = field(default=False)
+    # Preserve lightweight, evaluation-ready HF snapshots whenever Trainer saves a
+    # resumable checkpoint.  DeepSpeed optimizer state is intentionally excluded.
+    save_eval_snapshots: bool = field(default=False)
+    eval_snapshot_dir: Optional[str] = field(default=None)
 
     ## Lora config
     lora_enable: bool = field(default=False)
