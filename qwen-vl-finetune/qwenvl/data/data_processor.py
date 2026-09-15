@@ -119,9 +119,7 @@ def update_processor_pixels(processor, data_args):
             rank0_print(
                 f"✅ Updated Video size (shortest_edge): {vp.size.get('shortest_edge', 'N/A')}"
             )
-            rank0_print(
-                f"✅ Updated Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}"
-            )
+            rank0_print(f"✅ Updated Video size (longest_edge):  {vp.size.get('longest_edge', 'N/A')}")
 
         rank0_print("=== AFTER VIDEO PROCESSOR PARAMETERS ===")
         rank0_print(f"Video min_pixels: {getattr(vp, 'min_pixels', 'N/A')}")
@@ -138,7 +136,6 @@ def update_processor_pixels(processor, data_args):
 
 
 def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any]]:
-    # Extract and normalize images and videos
     images = item.get("image") or []
     if isinstance(images, str):
         images = [images]
@@ -147,7 +144,6 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
     if isinstance(videos, str):
         videos = [videos]
 
-    # Build media pools with absolute paths
     image_pool = [
         {"type": "image", "image": _make_abs_paths(base_path, img)} for img in images
     ]
@@ -162,7 +158,6 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
         if role == "user":
             content = []
-            # Split text by <image> or <video> placeholders while keeping delimiters
             text_parts = re.split(r"(<image>|<video>)", text)
 
             for seg in text_parts:
@@ -183,10 +178,8 @@ def _build_messages(item: Dict[str, Any], base_path: Path) -> List[Dict[str, Any
 
             messages.append({"role": role, "content": content})
         else:
-            # Assistant messages contain only text
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
 
-    # Check for unused media files
     if image_pool:
         raise ValueError(
             f"{len(image_pool)} image(s) remain unused (not consumed by placeholders)"
@@ -291,8 +284,6 @@ class LazySupervisedDataset(Dataset):
             list_data_dict += annotations
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
-
-
         rank0_print("Formatting inputs...Skip in lazy mode")
         processor = update_processor_pixels(processor, data_args)
         self.processor = processor
@@ -344,9 +335,7 @@ class LazySupervisedDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         num_base_retries = 3
-        num_final_retries = 30
 
-        # try the current sample first
         for attempt_idx in range(num_base_retries):
             try:
                 sources = self.list_data_dict[i]
@@ -355,11 +344,9 @@ class LazySupervisedDataset(Dataset):
                 sample = self.item_fn(sources)
                 return sample
             except Exception as e:
-                # sleep 1s in case it is a cloud disk issue
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
                 time.sleep(1)
 
-        # try other samples, in case it is file corruption issue
         for attempt_idx in range(num_base_retries):
             try:
                 next_index = min(i + 1, len(self.list_data_dict) - 1)
@@ -370,21 +357,15 @@ class LazySupervisedDataset(Dataset):
                 sample = self.item_fn(sources)
                 return sample
             except Exception as e:
-                # no need to sleep
                 print(
                     f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:",
                     e,
                 )
-                pass
 
-        try:
-            sources = self.list_data_dict[i]
-            if isinstance(sources, dict):
-                sources = [sources]
-            sample = self.item_fn(sources)
-            return sample
-        except Exception as e:
-            raise e
+        sources = self.list_data_dict[i]
+        if isinstance(sources, dict):
+            sources = [sources]
+        return self.item_fn(sources)
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
         data_dict = preprocess_qwen_visual(
@@ -426,25 +407,26 @@ class LazySupervisedDataset(Dataset):
         data_dict["position_ids"] = position_ids
         data_dict["attention_mask"] = [seq_len]
 
-        text = self.processor.tokenizer.decode(
-            data_dict["input_ids"][0], skip_special_tokens=False
-        )
-
-        labels = data_dict["labels"][0]
-        labels = [
-            tid if tid != -100 else self.processor.tokenizer.pad_token_id
-            for tid in labels
-        ]
-        label = self.processor.tokenizer.decode(labels, skip_special_tokens=False)
+        # Legacy debug code decoded input/label token IDs into strings for every
+        # sample but never consumed the strings. Keep it behind an explicit
+        # benchmark switch so the optimized path does no redundant tokenization.
+        if getattr(self.data_args, "decode_unused_text", False):
+            self.processor.tokenizer.decode(
+                data_dict["input_ids"][0], skip_special_tokens=False
+            )
+            labels = data_dict["labels"][0]
+            debug_labels = [
+                tid if tid != -100 else self.processor.tokenizer.pad_token_id
+                for tid in labels
+            ]
+            self.processor.tokenizer.decode(debug_labels, skip_special_tokens=False)
 
         return data_dict
 
     def _get_packed_item(self, sources) -> Dict[str, torch.Tensor]:
-
         if isinstance(sources, dict):
-            if isinstance(source, dict):
-                sources = [sources]
-            assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+            sources = [sources]
+            assert len(sources) == 1, "Don't know why it is wrapped to a list"
             return self._get_item(sources)
 
         if isinstance(sources, list):
@@ -455,7 +437,7 @@ class LazySupervisedDataset(Dataset):
                     source = [source]
                 assert (
                     len(source) == 1
-                ), f"Don't know why it is wrapped to a list.\n {source}"  # FIXME
+                ), f"Don't know why it is wrapped to a list.\n {source}"
                 data_list.append(self._get_item(source))
 
             input_ids = torch.cat([d["input_ids"] for d in data_list], dim=1)
@@ -475,19 +457,11 @@ class LazySupervisedDataset(Dataset):
                 new_data_dict.update(
                     {
                         "pixel_values": torch.cat(
-                            [
-                                d["pixel_values"]
-                                for d in data_list
-                                if "pixel_values" in d
-                            ],
+                            [d["pixel_values"] for d in data_list if "pixel_values" in d],
                             dim=0,
                         ),
                         "image_grid_thw": torch.cat(
-                            [
-                                d["image_grid_thw"]
-                                for d in data_list
-                                if "image_grid_thw" in d
-                            ],
+                            [d["image_grid_thw"] for d in data_list if "image_grid_thw" in d],
                             dim=0,
                         ),
                     }
@@ -497,19 +471,11 @@ class LazySupervisedDataset(Dataset):
                 new_data_dict.update(
                     {
                         "pixel_values_videos": torch.cat(
-                            [
-                                d["pixel_values_videos"]
-                                for d in data_list
-                                if "pixel_values_videos" in d
-                            ],
+                            [d["pixel_values_videos"] for d in data_list if "pixel_values_videos" in d],
                             dim=0,
                         ),
                         "video_grid_thw": torch.cat(
-                            [
-                                d["video_grid_thw"]
-                                for d in data_list
-                                if "video_grid_thw" in d
-                            ],
+                            [d["video_grid_thw"] for d in data_list if "video_grid_thw" in d],
                             dim=0,
                         ),
                     }
@@ -527,14 +493,11 @@ def pad_and_cat(tensor_list):
         padded_tensors.append(padded_tensor)
 
     stacked_tensor = torch.cat(padded_tensors, dim=1)
-
     return stacked_tensor
 
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
@@ -603,8 +566,6 @@ class DataCollatorForSupervisedDataset(object):
 
 @dataclass
 class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset):
-    """Collate examples into packed sequence with multi-modal support."""
-
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
@@ -676,7 +637,6 @@ class FlattenedDataCollatorForSupervisedDataset(DataCollatorForSupervisedDataset
 
 
 def make_supervised_data_module(processor, data_args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
     train_dataset = LazySupervisedDataset(processor, data_args=data_args)
     if data_args.data_flatten or data_args.data_packing:
         data_collator = FlattenedDataCollatorForSupervisedDataset(processor.tokenizer)
