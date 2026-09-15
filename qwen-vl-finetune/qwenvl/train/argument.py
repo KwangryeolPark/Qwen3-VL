@@ -23,6 +23,9 @@ class DataArguments:
     video_max_pixels: int = field(default=1024 * 28 * 28)
     video_min_pixels: int = field(default=256 * 28 * 28)
     video_fps: float = 2
+    # Re-enable legacy debug-only tokenizer decodes for throughput comparison.
+    # These decoded strings are not consumed by training.
+    decode_unused_text: bool = field(default=False)
 
 
 @dataclass
@@ -37,6 +40,9 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+    # Benchmark-only switch: skip expensive final HF/processor save while retaining
+    # the full train loop and trainer metrics.
+    skip_final_save: bool = field(default=False)
 
     ## Lora config
     lora_enable: bool = field(default=False)
