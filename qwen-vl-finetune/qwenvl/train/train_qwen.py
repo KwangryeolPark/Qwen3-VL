@@ -6,7 +6,7 @@
 #    you may not use this file except in compliance with the License.
 #    You may obtain a copy of the License at
 #
-#        http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 #    Unless required by applicable law or agreed to in writing, software
 #    distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,13 +14,16 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import os
+import json
 import logging
+import os
 import pathlib
-import torch
-import transformers
+import shutil
 import sys
 from pathlib import Path
+
+import torch
+import transformers
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -28,10 +31,13 @@ sys.path.append(str(project_root))
 from trainer import replace_qwen2_vl_attention_class
 
 from transformers import (
+    AutoProcessor,
     Qwen2VLForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
-    Qwen3VLMoeForConditionalGeneration
+    Qwen3VLMoeForConditionalGeneration,
+    Trainer,
+    TrainerCallback,
 )
 from qwenvl.data.data_processor import make_supervised_data_module
 from qwenvl.train.argument import (
@@ -39,7 +45,6 @@ from qwenvl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoProcessor, Trainer
 
 local_rank = None
 
@@ -50,7 +55,7 @@ def rank0_print(*args):
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
-    """Collects the state dict and dump to disk."""
+    """Collects the state dict and dumps it to disk."""
 
     if trainer.deepspeed:
         torch.cuda.synchronize()
@@ -62,6 +67,83 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
+
+
+def _hardlink_or_copy(src: Path, dst: Path):
+    """Hard-link a file when possible, falling back to a normal copy."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+class EvalSnapshotCallback(TrainerCallback):
+    """Preserve evaluation-ready model snapshots without DeepSpeed optimizer state.
+
+    Trainer writes a full resumable checkpoint at each save event.  With
+    save_total_limit=1 only the latest such checkpoint is retained.  This callback
+    hard-links the model/tokenizer/config files from each checkpoint into a
+    separate snapshot directory and writes the processor files there.  The large
+    DeepSpeed optimizer state is therefore kept only for the most recent resume
+    checkpoint, while milestone model weights remain available for evaluation.
+    """
+
+    # Root-level Trainer files needed to reload the HF model/tokenizer.  Processor
+    # files are written separately via processor.save_pretrained().
+    _EXCLUDED_FILES = {
+        "optimizer.pt",
+        "scheduler.pt",
+        "scaler.pt",
+        "trainer_state.json",
+        "training_args.bin",
+    }
+
+    def __init__(self, processor, snapshot_root: str):
+        self.processor = processor
+        self.snapshot_root = Path(snapshot_root)
+
+    def on_save(self, args, state, control, **kwargs):
+        if not args.should_save:
+            return control
+
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if not checkpoint_dir.exists():
+            logging.warning("Snapshot source checkpoint does not exist: %s", checkpoint_dir)
+            return control
+
+        epoch = float(state.epoch) if state.epoch is not None else -1.0
+        snapshot_dir = self.snapshot_root / f"epoch-{epoch:.2f}-step-{state.global_step}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        copied = []
+        for src in checkpoint_dir.iterdir():
+            if not src.is_file() or src.name in self._EXCLUDED_FILES:
+                continue
+            # Do not retain RNG or other training-only state files.
+            if src.name.startswith("rng_state"):
+                continue
+            _hardlink_or_copy(src, snapshot_dir / src.name)
+            copied.append(src.name)
+
+        # Qwen VL evaluation requires image/video processor metadata in addition
+        # to the tokenizer files saved by Trainer.
+        self.processor.save_pretrained(snapshot_dir)
+
+        metadata = {
+            "global_step": int(state.global_step),
+            "epoch": epoch,
+            "source_checkpoint": str(checkpoint_dir),
+            "copied_files": sorted(copied),
+            "optimizer_state_included": False,
+        }
+        with open(snapshot_dir / "snapshot_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"Saved evaluation snapshot: {snapshot_dir}")
+        return control
 
 
 def set_model(model_args, model):
@@ -187,6 +269,13 @@ def train(attn_implementation="flash_attention_2"):
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
+
+    if training_args.save_eval_snapshots:
+        snapshot_root = training_args.eval_snapshot_dir
+        if not snapshot_root:
+            snapshot_root = str(Path(training_args.output_dir) / "eval_snapshots")
+        trainer.add_callback(EvalSnapshotCallback(processor, snapshot_root))
+        rank0_print(f"Evaluation snapshots enabled: {snapshot_root}")
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         logging.info("checkpoint found, resume training")
