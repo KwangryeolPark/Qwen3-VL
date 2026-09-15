@@ -1,6 +1,6 @@
 # Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
 # Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
-#    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
+#    Copyright 2023 Rohan Taori, Tianyi Zhang, Yann Dubois, Xuechen Li
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -171,7 +171,7 @@ def train(attn_implementation="flash_attention_2"):
             r=training_args.lora_r or 64,
             lora_alpha=training_args.lora_alpha or 128,
             lora_dropout=training_args.lora_dropout or 0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # Qwen 的 attention 线性层
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             bias="none",
             task_type=TaskType.CAUSAL_LM,
         )
@@ -182,7 +182,7 @@ def train(attn_implementation="flash_attention_2"):
         if torch.distributed.get_rank() == 0:
             model.visual.print_trainable_parameters()
             model.model.print_trainable_parameters()
-    
+
     data_module = make_supervised_data_module(processor, data_args=data_args)
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
@@ -193,12 +193,14 @@ def train(attn_implementation="flash_attention_2"):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+
+    if training_args.skip_final_save:
+        rank0_print("Skipping trainer state/model/processor save for benchmark run.")
+        return
+
     trainer.save_state()
-
     model.config.use_cache = True
-
     safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-    
     processor.save_pretrained(training_args.output_dir)
 
 
